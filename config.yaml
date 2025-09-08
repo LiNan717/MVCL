@@ -1,0 +1,19 @@
+CPDB:
+  seed: 1234
+  LR: 0.01
+  drop_edge_rate_1: 0.2
+  drop_edge_rate_2: 0.1
+  drop_edge_rate_3: 0.1
+  drop_edge_rate_4: 0.05
+  drop_feature_rate_1: 0.5
+  drop_feature_rate_2: 0.4
+  drop_feature_rate_3: 0.4
+  drop_feature_rate_4: 0.4
+  tau: 0.3
+  EPOCH: 701
+  num_clusters: 8
+  threshold: 0.5
+  
+
+
+
