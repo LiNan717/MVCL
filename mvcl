@@ -1,0 +1,200 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from torch_geometric.nn import ChebConv
+from gcn import DeepResidualGCN
+
+
+class MLP(nn.Module):
+    def __init__(self, inp_size, hidden_size, outp_size):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(inp_size, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ELU(),
+            nn.Linear(hidden_size, outp_size)
+        )
+        for model in self.net:
+            if isinstance(model, nn.Linear):
+                nn.init.xavier_normal_(model.weight, gain=1.414)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Cluster_MLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_clusters):
+        super(Cluster_MLP, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, num_clusters)
+        self.num_clusters = num_clusters
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        x = F.softmax(x, dim=-1)
+        return x
+
+
+class GraphEncoder(nn.Module):
+    def __init__(self, gnn, ):
+        super().__init__()
+        self.gnn = gnn
+
+    def forward(self, adj, in_feats):
+        representations = self.gnn(in_feats, adj)
+        representations = representations.view(-1, representations.size(-1))
+        return representations
+
+
+def sim(z1: torch.Tensor, z2: torch.Tensor):
+    z1 = F.normalize(z1)
+    z2 = F.normalize(z2)
+    return torch.mm(z1, z2.t())
+
+
+def contrastive_loss(h1, h2, pos, tau):
+    sim_matrix = sim(h1, h2)
+    f = lambda x: torch.exp(x / tau)
+    matrix_t = f(sim_matrix)
+    numerator = matrix_t.mul(pos).sum(dim=-1)
+    denominator = torch.sum(matrix_t, dim=-1)
+    loss = -torch.log(numerator / denominator).mean()
+    return loss
+
+
+class MVCL(nn.Module):
+    def __init__(self,
+                 pos,
+                 high_confidence_idx,
+                 cluster_ids,
+                 num_clusters,
+                 tau,
+                 gnn_outsize,
+                 projection_size,
+                 projection_hidden_size,
+                 ):
+        super().__init__()
+        self.projector = MLP(gnn_outsize, projection_hidden_size, projection_size)
+        self.pos = pos
+        self.tau = tau
+        self.high_confidence_idx = high_confidence_idx
+        self.cluster_ids = cluster_ids
+        self.num_clusters = num_clusters
+        self.conv1 = ChebConv(gnn_outsize, 1, K=2, normalization="sym")
+        self.conv2 = ChebConv(gnn_outsize, 1, K=2, normalization="sym")
+        self.conv3 = ChebConv(gnn_outsize, 1, K=2, normalization="sym")
+        self.conv4 = ChebConv(gnn_outsize, 1, K=2, normalization="sym")
+        self.convp = DeepResidualGCN(64, 300, 100, 3)
+        self.convpa = DeepResidualGCN(64, 300, 100, 7)
+        self.convg = DeepResidualGCN(64, 300, 100, 4)
+        self.convseq = DeepResidualGCN(64, 300, 100, 2)
+
+        self.clus_pro = Cluster_MLP(gnn_outsize, 256, 32)
+
+    def cluster_loss(self, cluster_probs):
+        """
+        Calculate the cluster loss based on high confidence samples.
+
+        :param cluster_probs: List of cluster probabilities for each view.
+        :return: Cluster loss.
+        """
+        # Select high confidence samples
+        index = torch.tensor(range(cluster_probs[0].shape[0]), device=cluster_probs[0].device)[self.high_confidence_idx]
+        y_sam = torch.tensor(self.cluster_ids, device=cluster_probs[0].device)[self.high_confidence_idx]
+        index = index[torch.argsort(y_sam)]
+
+        # Count samples in each cluster
+        class_num = {}
+        for label in torch.sort(y_sam).values:
+            label = label.item()
+            if label in class_num.keys():
+                class_num[label] += 1
+            else:
+                class_num[label] = 1
+
+        key = sorted(class_num.keys())
+        if len(class_num) < 2:
+            return 0
+
+        # Calculate positive contrastive loss
+        pos_contrastive1 = 0
+        pos_contrastive2 = 0
+        pos_contrastive3 = 0
+        centers_1 = torch.tensor([], device=cluster_probs[0].device)
+        centers_2 = torch.tensor([], device=cluster_probs[0].device)
+        centers_3 = torch.tensor([], device=cluster_probs[0].device)
+        centers_4 = torch.tensor([], device=cluster_probs[0].device)
+
+        for i in range(len(key[:-1])):
+            class_num[key[i + 1]] = class_num[key[i]] + class_num[key[i + 1]]
+            now = index[class_num[key[i]]:class_num[key[i + 1]]]
+            pos_embed_1 = cluster_probs[0][np.random.choice(now.cpu(), size=int((now.shape[0] * 0.8)), replace=False)]
+            pos_embed_2 = cluster_probs[1][np.random.choice(now.cpu(), size=int((now.shape[0] * 0.8)), replace=False)]
+            pos_embed_3 = cluster_probs[2][np.random.choice(now.cpu(), size=int((now.shape[0] * 0.8)), replace=False)]
+            pos_contrastive1 += (2 - 2 * torch.sum(pos_embed_1 * pos_embed_2, dim=1)).sum()
+            pos_contrastive2 += (2 - 2 * torch.sum(pos_embed_1 * pos_embed_3, dim=1)).sum()
+            centers_1 = torch.cat([centers_1, torch.mean(cluster_probs[0][now], dim=0).unsqueeze(0)], dim=0)
+            centers_2 = torch.cat([centers_2, torch.mean(cluster_probs[1][now], dim=0).unsqueeze(0)], dim=0)
+            centers_3 = torch.cat([centers_3, torch.mean(cluster_probs[2][now], dim=0).unsqueeze(0)], dim=0)
+
+        pos_contrastive1 = pos_contrastive1 / self.num_clusters
+        pos_contrastive2 = pos_contrastive2 / self.num_clusters
+        if pos_contrastive1 == 0 and pos_contrastive2 == 0:
+            return 0
+
+        # Calculate negative contrastive loss
+        centers_1 = F.normalize(centers_1, dim=1, p=2)
+        centers_2 = F.normalize(centers_2, dim=1, p=2)
+        centers_3 = F.normalize(centers_3, dim=1, p=2)
+        S1 = centers_1 @ centers_2.T
+        S2 = centers_1 @ centers_3.T
+        S1_diag = torch.diag_embed(torch.diag(S1))
+        S2_diag = torch.diag_embed(torch.diag(S2))
+        S1 = S1 - S1_diag
+        S2 = S2 - S2_diag
+        neg_contrastive1 = F.mse_loss(S1, torch.zeros_like(S1))
+        neg_contrastive2 = F.mse_loss(S2, torch.zeros_like(S2))
+        loss = (
+                           pos_contrastive1 + neg_contrastive1 + pos_contrastive2 + neg_contrastive2) / 16  # pos_contrastive1 + neg_contrastive1 +
+
+        return loss
+
+    def forward(self, aug_adj_1, aug_adj_2, aug_adj_3, aug_adj_4, aug_feat_1, aug_feat_2, aug_feat_3, aug_feat_4):
+
+        encoder_one = self.convp(aug_adj_1, aug_feat_1)
+        encoder_two = self.convpa(aug_adj_2, aug_feat_2)
+        encoder_three = self.convg(aug_adj_3, aug_feat_3)
+        encoder_four = self.convseq(aug_adj_4, aug_feat_4)
+
+        # Instance contrastive loss
+        proj_one = self.projector(encoder_one)
+        # proj_two = self.projector(encoder_two)
+        # proj_three = self.projector(encoder_three)
+        # proj_four = self.projector(encoder_four)
+        l1 = contrastive_loss(proj_one, proj_one, self.pos[0], self.tau)
+        # l2 = contrastive_loss(proj_two, proj_two, self.pos[1], self.tau)
+        # l3 = contrastive_loss(proj_three, proj_three, self.pos[2], self.tau)
+        # l4 = contrastive_loss(proj_four, proj_four, self.pos[3], self.tau)
+        l5 = contrastive_loss(proj_one, proj_one, self.pos[1], self.tau)
+        l6 = contrastive_loss(proj_one, proj_one, self.pos[2], self.tau)
+        l7 = contrastive_loss(proj_one, proj_one, self.pos[3], self.tau)
+        Conloss = 0.4 * l1 + 0.25 * (l5 + l6) + 0.1 * l7  # +0.15*l2+0.15*l3+0.05*l4
+
+        # Cluster contrastive loss
+        cL = 0
+        encoder_views = [encoder_one, encoder_two, encoder_three]  #
+        cluster_probs = [self.clus_pro(view) for view in encoder_views]
+        cluster_loss_value = self.cluster_loss(cluster_probs)
+        cL += cluster_loss_value
+
+        # Learning network-specific gene feature
+        emb1 = self.conv1(encoder_one, aug_adj_1)
+        emb2 = self.conv2(encoder_two, aug_adj_2)
+        emb3 = self.conv3(encoder_three, aug_adj_3)
+        emb4 = self.conv3(encoder_four, aug_adj_3)
+
+        # Logistic Regression Module input feature
+        emb = torch.cat((emb1, emb2, emb3, emb4), 1)
+        return emb1, emb2, emb3, emb4, emb, 0.5 * Conloss + 0.5 * cL
